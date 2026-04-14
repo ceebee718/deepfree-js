@@ -1,0 +1,52 @@
+{
+  "name": "deepfree",
+  "version": "1.0.0",
+  "description": "Cryptographic carrier authentication for live voice calls. Embeds a time-varying HMAC-derived signal into audio to verify speaker identity — immune to AI voice clones.",
+  "main": "dist/deepfree.js",
+  "module": "dist/deepfree.esm.js",
+  "browser": "dist/deepfree.js",
+  "unpkg": "dist/deepfree.min.js",
+  "jsdelivr": "dist/deepfree.min.js",
+  "types": "dist/deepfree.d.ts",
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node build.js",
+    "prepare": "node build.js"
+  },
+  "keywords": [
+    "voice-authentication",
+    "audio-watermarking",
+    "deepfake-detection",
+    "voice-clone",
+    "hmac",
+    "webrtc",
+    "audio",
+    "cryptography",
+    "fraud-prevention",
+    "speaker-verification"
+  ],
+  "author": "DeepFree <hello@deepfree.app>",
+  "license": "MIT",
+  "homepage": "https://deepfree.app",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ceebee718/deepfree-js"
+  },
+  "bugs": {
+    "url": "https://github.com/ceebee718/deepfree-js/issues",
+    "email": "hello@deepfree.app"
+  },
+  "engines": {
+    "node": ">=14"
+  },
+  "browserslist": [
+    "last 2 Chrome versions",
+    "last 2 Firefox versions",
+    "last 2 Safari versions",
+    "last 2 Edge versions"
+  ]
+}
