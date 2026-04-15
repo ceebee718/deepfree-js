@@ -18,12 +18,29 @@
  *   device_key — same treatment (non-extractable CryptoKey, IndexedDB).
  *   username / device_id / device_name — not secret; stored in localStorage.
  *
- * NOTE — nonce-challenge protocol (TODO):
- *   Currently the server compares raw user_key strings on /rotate, /me,
- *   /timing_offset, /reset_timing and the WebSocket token.  A future sprint
- *   will replace these with HMAC-signed server nonces so the raw key never
- *   crosses the wire.  Until then the key is sent raw on those endpoints only.
- *   The _signWithUserKey() helper below is the intended replacement call site.
+ * NONCE-CHALLENGE PROTOCOL (GROUP 14 — deployed):
+ *   /rotate, /timing_offset, /reset_timing, and the WebSocket all now accept
+ *   X-User-Nonce + X-User-Sig instead of a raw X-User-Key.
+ *   Flow: GET /auth/nonce/{username} → sign nonce with _userCryptoKey → send sig.
+ *   SDK methods that need user auth use _sdkNonceHeaders() internally.
+ *   Raw-key legacy path kept for one release cycle (remove in v1.2.0).
+ *
+ * call.html MIGRATION (when you share that file):
+ *   Replace every occurrence of:
+ *     new WebSocket(`wss://...?token=${userKey}`)
+ *   with:
+ *     const wsUrl = await df.buildWsUrl(roomId);
+ *     new WebSocket(wsUrl)
+ *
+ *   Replace every occurrence of:
+ *     fetch(`/timing_offset/${u}`, { headers: { 'X-User-Key': userKey } })
+ *   with:
+ *     await df.fetchTimingOffset()
+ *
+ *   Replace every occurrence of:
+ *     fetch(`/reset_timing/${u}`, { method:'POST', headers: { 'X-User-Key': userKey } })
+ *   with:
+ *     await df.resetTiming()
  */
 
 (function (root, factory) {
@@ -213,17 +230,37 @@
   }
 
   /**
-   * Sign data with the user's CryptoKey (non-extractable).
-   * Future: replace raw-key transmission on /rotate, /timing_offset, etc.
-   * with server-issued nonces signed here.
+   * Sign a message with a non-extractable CryptoKey.
+   * Used internally by _sdkNonceHeaders() for all authenticated SDK requests.
    * @param {CryptoKey} userCryptoKey
-   * @param {string} message
-   * @returns {Promise<string>} hex signature
+   * @param {string} message — typically the server-issued nonce string
+   * @returns {Promise<string>} hex-encoded HMAC-SHA256 signature
    */
   async function _signWithUserKey(userCryptoKey, message) {
     const enc = new TextEncoder();
     const sig = await crypto.subtle.sign('HMAC', userCryptoKey, enc.encode(message));
     return Array.from(new Uint8Array(sig)).map(function (b) { return b.toString(16).padStart(2, '0'); }).join('');
+  }
+
+  /**
+   * Fetch a server nonce and return signed auth headers.
+   * Produces { 'X-User-Nonce': nonce, 'X-User-Sig': hexSig } ready to
+   * spread into any fetch() call that requires user authentication.
+   * Used by rotate(), fetchTimingOffset(), and any future user-auth endpoints.
+   * @param {string} backendUrl
+   * @param {string} username
+   * @param {CryptoKey} userCryptoKey
+   * @returns {Promise<Object>} header object
+   */
+  async function _sdkNonceHeaders(backendUrl, username, userCryptoKey) {
+    const res = await fetch(backendUrl + '/auth/nonce/' + username, {
+      headers: { 'Cache-Control': 'no-store' }
+    });
+    if (!res.ok) throw new Error('Nonce fetch failed: ' + res.status);
+    const data  = await res.json();
+    const nonce = data.nonce;
+    const sig   = await _signWithUserKey(userCryptoKey, nonce);
+    return { 'X-User-Nonce': nonce, 'X-User-Sig': sig };
   }
 
   // ─── DEEPFREE CLASS ──────────────────────────────────────────────────────
@@ -468,12 +505,28 @@
    * Validate stored credentials against the backend.
    * @returns {Promise<boolean>}
    */
+  /**
+   * Validate stored credentials against the backend.
+   * Uses nonce-challenge auth to update last_seen on the server.
+   * @returns {Promise<boolean>}
+   */
   DeepFree.prototype.validateCredentials = async function () {
     if (!this._user) return false;
     try {
-      const data = await this._get(`/me/${this._user.username}`);
+      const username = this._user.username;
+      // Use nonce auth to prove ownership and update last_seen
+      const authHdrs = await _sdkNonceHeaders(
+        this._backendUrl, username, this._user._userCryptoKey
+      );
+      const res = await fetch(this._backendUrl + '/me/' + username, {
+        headers: Object.assign({}, this._headers(), authHdrs,
+          { 'Cache-Control': 'no-store' }),
+      });
+      if (!res.ok) return false;
+      const data = await res.json();
       return data.valid === true;
     } catch (e) {
+      this._log('validateCredentials failed:', e.message);
       return false;
     }
   };
@@ -941,6 +994,108 @@ registerProcessor('carrier-embedder', CarrierEmbedderProcessor);
     return this._sendChunk(samples, tw);
   };
 
+  // ─── NONCE-AUTHENTICATED METHODS (Group 14) ──────────────────────────────
+
+  /**
+   * Rotate the user's authentication key.
+   * Uses the nonce-challenge protocol — the raw key is never sent over the wire.
+   * The new key is imported as a non-extractable CryptoKey and stored in IndexedDB.
+   * @returns {Promise<{ username: string }>}
+   */
+  DeepFree.prototype.rotateKey = async function () {
+    if (!this._user) throw new Error('DeepFree: not registered');
+    const username = this._user.username;
+    const authHdrs = await _sdkNonceHeaders(
+      this._backendUrl, username, this._user._userCryptoKey
+    );
+    const res = await fetch(this._backendUrl + '/rotate', {
+      method:  'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, this._headers()),
+      body: JSON.stringify({
+        username:     username,
+        nonce:        authHdrs['X-User-Nonce'],
+        user_key_sig: authHdrs['X-User-Sig'],
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'HTTP ' + res.status);
+    // Import new key immediately; raw string never stored
+    const newCryptoKey = await _sdkImportKey(data.user_key);
+    await _sdkStoreKey(_SDK_UK_STORE, username, newCryptoKey);
+    this._user._userCryptoKey = newCryptoKey;
+    this._log('Key rotated for', username);
+    return { username };
+  };
+
+  /**
+   * Fetch the enrolled timing offset for the current user's device.
+   * Uses the nonce-challenge protocol — no raw key sent.
+   * Call this at the start of each call to get the delay in ms.
+   * @returns {Promise<{ timing_offset_ms: number, device_id: string }>}
+   */
+  DeepFree.prototype.fetchTimingOffset = async function () {
+    if (!this._user) throw new Error('DeepFree: not registered');
+    const username = this._user.username;
+    const authHdrs = await _sdkNonceHeaders(
+      this._backendUrl, username, this._user._userCryptoKey
+    );
+    const res = await fetch(this._backendUrl + '/timing_offset/' + username, {
+      headers: Object.assign({}, this._headers(), authHdrs,
+        { 'Cache-Control': 'no-store' }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'HTTP ' + res.status);
+    this._timingOffset = data.timing_offset_ms || 0;
+    this._log('Timing offset fetched:', this._timingOffset, 'ms');
+    return data;
+  };
+
+  /**
+   * Reset the timing session for the current user.
+   * Call at the start of each new call to clear accumulated timing evidence.
+   * Uses the nonce-challenge protocol — no raw key sent.
+   * @returns {Promise<{ reset: boolean }>}
+   */
+  DeepFree.prototype.resetTiming = async function () {
+    if (!this._user) throw new Error('DeepFree: not registered');
+    const username = this._user.username;
+    const authHdrs = await _sdkNonceHeaders(
+      this._backendUrl, username, this._user._userCryptoKey
+    );
+    const res = await fetch(this._backendUrl + '/reset_timing/' + username, {
+      method:  'POST',
+      headers: Object.assign({}, this._headers(), authHdrs),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'HTTP ' + res.status);
+    this._log('Timing session reset for', username);
+    return data;
+  };
+
+  /**
+   * Build a WebSocket URL using the nonce-challenge protocol.
+   * Returns a URL string ready for `new WebSocket(url)`.
+   * Use this instead of constructing ?token= URLs — no raw key in the URL.
+   *
+   * Example:
+   *   const url = await df.buildWsUrl(roomId);
+   *   const ws  = new WebSocket(url);
+   *
+   * @param {string} roomId
+   * @returns {Promise<string>} wss://... URL with ?nonce=&sig= params
+   */
+  DeepFree.prototype.buildWsUrl = async function (roomId) {
+    if (!this._user) throw new Error('DeepFree: not registered');
+    const username = this._user.username;
+    const authHdrs = await _sdkNonceHeaders(
+      this._backendUrl, username, this._user._userCryptoKey
+    );
+    const base = this._backendUrl.replace(/^http/, 'ws');
+    const nonce = encodeURIComponent(authHdrs['X-User-Nonce']);
+    const sig   = encodeURIComponent(authHdrs['X-User-Sig']);
+    return base + '/ws/' + roomId + '/' + username + '?nonce=' + nonce + '&sig=' + sig;
+  };
+
   // ─── UTILITY ─────────────────────────────────────────────────────────────
 
   /**
@@ -970,7 +1125,7 @@ registerProcessor('carrier-embedder', CarrierEmbedderProcessor);
 
   // ─── STATIC ──────────────────────────────────────────────────────────────
 
-  DeepFree.version = '1.1.0';
+  DeepFree.version = '1.2.0';
   DeepFree.WINDOW_SEC   = WINDOW_SEC;
   DeepFree.CHUNK_FRAMES = CHUNK_FRAMES;
   DeepFree.SAMPLE_RATE  = SAMPLE_RATE;
