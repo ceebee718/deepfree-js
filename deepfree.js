@@ -1,5 +1,5 @@
 /**
- * DeepFree Web SDK v1.0.0
+ * DeepFree Web SDK v1.1.0
  * Cryptographic carrier authentication for live voice calls.
  *
  * Usage:
@@ -9,6 +9,21 @@
  *   await df.startAuth(mediaStream);
  *   df.on('score', ({ confidence, status, verified }) => console.log(verified));
  *   await df.stopAuth();
+ *
+ * SECURITY — credential storage (SDK-H1 / SDK-H2):
+ *   user_key  — stored as a non-extractable HMAC CryptoKey in IndexedDB.
+ *               The raw hex string is NEVER written to localStorage or kept
+ *               in a JS string after the initial import. Cannot be read back
+ *               by JS or browser DevTools.
+ *   device_key — same treatment (non-extractable CryptoKey, IndexedDB).
+ *   username / device_id / device_name — not secret; stored in localStorage.
+ *
+ * NOTE — nonce-challenge protocol (TODO):
+ *   Currently the server compares raw user_key strings on /rotate, /me,
+ *   /timing_offset, /reset_timing and the WebSocket token.  A future sprint
+ *   will replace these with HMAC-signed server nonces so the raw key never
+ *   crosses the wire.  Until then the key is sent raw on those endpoints only.
+ *   The _signWithUserKey() helper below is the intended replacement call site.
  */
 
 (function (root, factory) {
@@ -34,26 +49,41 @@
   // ─── CRYPTO HELPERS ──────────────────────────────────────────────────────
 
   /**
-   * Derive combined secret from user key + device key.
-   * Mirrors backend derive_combined_secret exactly.
-   * @param {string} userKey
-   * @param {string} deviceKey
-   * @returns {Promise<string>} hex string
+   * Derive combined secret from a user CryptoKey and a device CryptoKey.
+   *
+   * SDK-H1: Both keys are non-extractable — this function signs a fixed message
+   * with the device key, then hashes (userKey-hex-from-sign || deviceSig) to
+   * produce a deterministic seed.  Mirrors index.html combinedSecret() exactly.
+   *
+   * @param {CryptoKey} userCryptoKey  — non-extractable HMAC key
+   * @param {CryptoKey} deviceCryptoKey — non-extractable HMAC key
+   * @returns {Promise<string>} hex string seed
    */
-  async function combinedSecret(userKey, deviceKey) {
-    const enc  = new TextEncoder();
-    const data = enc.encode(`${userKey}:${deviceKey}`);
-    const buf  = await crypto.subtle.digest('SHA-256', data);
+  async function combinedSecret(userCryptoKey, deviceCryptoKey) {
+    const enc = new TextEncoder();
+    // Sign a fixed label with the user key to get a stable user-contribution hex
+    const userSigBuf = await crypto.subtle.sign('HMAC', userCryptoKey, enc.encode('user-contribution'));
+    const userHex    = Array.from(new Uint8Array(userSigBuf))
+      .map(function (b) { return b.toString(16).padStart(2, '0'); }).join('');
+    // Sign the user-contribution with the device key for the device contribution
+    const deviceSigBuf = await crypto.subtle.sign('HMAC', deviceCryptoKey, enc.encode(userHex));
+    const deviceHex    = Array.from(new Uint8Array(deviceSigBuf))
+      .map(function (b) { return b.toString(16).padStart(2, '0'); }).join('');
+    // Hash both contributions to produce the combined secret
+    const combined = enc.encode(userHex + ':' + deviceHex);
+    const buf = await crypto.subtle.digest('SHA-256', combined);
     return Array.from(new Uint8Array(buf))
-      .map(b => b.toString(16).padStart(2, '0'))
-      .join('');
+      .map(function (b) { return b.toString(16).padStart(2, '0'); }).join('');
   }
 
   /**
-   * Derive timing offset from credentials.
+   * Derive timing offset from raw credential strings.
+   * Called ONCE at register/loadCredentials time; result cached as _timingOffset.
+   * Raw strings are only alive during this call — they are imported to CryptoKeys
+   * immediately before and after.
    * Range: -400ms to +400ms. Mirrors backend derive_timing_offset.
-   * @param {string} userKey
-   * @param {string} deviceKey
+   * @param {string} userKey   — raw hex (transient, not stored after this call)
+   * @param {string} deviceKey — raw hex (transient, not stored after this call)
    * @returns {Promise<number>} offset in ms
    */
   async function deriveTimingOffset(userKey, deviceKey) {
@@ -118,6 +148,84 @@
     return Math.floor(Date.now() / 1000 / WINDOW_SEC);
   }
 
+  // ─── SECURE KEY STORE (SDK-H1 / SDK-H2) ──────────────────────────────────
+  // Both user_key and device_key are imported as non-extractable HMAC-SHA256
+  // CryptoKeys and stored in IndexedDB.  They can sign but cannot be exported.
+  // localStorage holds only non-secret metadata: username, device_id, device_name.
+
+  const _SDK_DB_NAME    = 'deepfree_sdk_keys';
+  const _SDK_DB_VERSION = 1;
+  const _SDK_UK_STORE   = 'user_keys';
+  const _SDK_DK_STORE   = 'device_keys';
+
+  function _sdkOpenDb() {
+    return new Promise(function (resolve, reject) {
+      const req = indexedDB.open(_SDK_DB_NAME, _SDK_DB_VERSION);
+      req.onupgradeneeded = function (e) {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains(_SDK_UK_STORE))  db.createObjectStore(_SDK_UK_STORE);
+        if (!db.objectStoreNames.contains(_SDK_DK_STORE))  db.createObjectStore(_SDK_DK_STORE);
+      };
+      req.onsuccess = function (e) { resolve(e.target.result); };
+      req.onerror   = function (e) { reject(e.target.error); };
+    });
+  }
+
+  function _sdkImportKey(rawHex) {
+    // Import a hex string as a non-extractable HMAC-SHA256 CryptoKey.
+    const rawBytes = new Uint8Array(rawHex.match(/.{2}/g).map(function (b) { return parseInt(b, 16); }));
+    return crypto.subtle.importKey(
+      'raw', rawBytes,
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,   // extractable: false — key can never leave the browser's crypto subsystem
+      ['sign']
+    );
+  }
+
+  function _sdkStoreKey(store, username, cryptoKey) {
+    return _sdkOpenDb().then(function (db) {
+      const tx = db.transaction(store, 'readwrite');
+      tx.objectStore(store).put(cryptoKey, username);
+      return new Promise(function (resolve, reject) {
+        tx.oncomplete = resolve;
+        tx.onerror    = function (e) { reject(e.target.error); };
+      });
+    });
+  }
+
+  function _sdkLoadKey(store, username) {
+    return _sdkOpenDb().then(function (db) {
+      const tx  = db.transaction(store, 'readonly');
+      const req = tx.objectStore(store).get(username);
+      return new Promise(function (resolve, reject) {
+        req.onsuccess = function (e) { resolve(e.target.result || null); };
+        req.onerror   = function (e) { reject(e.target.error); };
+      });
+    });
+  }
+
+  function _sdkDeleteKeys(username) {
+    return _sdkOpenDb().then(function (db) {
+      const tx = db.transaction([_SDK_UK_STORE, _SDK_DK_STORE], 'readwrite');
+      tx.objectStore(_SDK_UK_STORE).delete(username);
+      tx.objectStore(_SDK_DK_STORE).delete(username);
+    });
+  }
+
+  /**
+   * Sign data with the user's CryptoKey (non-extractable).
+   * Future: replace raw-key transmission on /rotate, /timing_offset, etc.
+   * with server-issued nonces signed here.
+   * @param {CryptoKey} userCryptoKey
+   * @param {string} message
+   * @returns {Promise<string>} hex signature
+   */
+  async function _signWithUserKey(userCryptoKey, message) {
+    const enc = new TextEncoder();
+    const sig = await crypto.subtle.sign('HMAC', userCryptoKey, enc.encode(message));
+    return Array.from(new Uint8Array(sig)).map(function (b) { return b.toString(16).padStart(2, '0'); }).join('');
+  }
+
   // ─── DEEPFREE CLASS ──────────────────────────────────────────────────────
 
   /**
@@ -137,8 +245,12 @@
     this._debug      = options.debug  || false;
 
     // Auth state
-    this._user       = null;   // { username, user_key }
-    this._device     = null;   // { device_id, device_key, device_name }
+    // SDK-H1: user_key and device_key are stored as non-extractable CryptoKeys
+    // in IndexedDB — they are NEVER held as strings in this object after import.
+    // _user holds { username, _userCryptoKey } after register/loadCredentials.
+    // _device holds { device_id, device_name } — device_key is in IndexedDB only.
+    this._user       = null;   // { username, _userCryptoKey (CryptoKey, non-extractable) }
+    this._device     = null;   // { device_id, device_name } — key is in IndexedDB
     this._sessionId  = null;
 
     // Audio pipeline
@@ -251,13 +363,20 @@
       device_name: opts.deviceName  || 'DeepFree SDK Device',
     });
 
-    this._user   = { username: data.username, user_key: data.user_key };
-    this._device = { device_id: data.device_id, device_key: data.device_key, device_name: data.device_name };
+    // SDK-H1: Import user_key and device_key as non-extractable CryptoKeys.
+    // Raw hex strings are discarded after import — they never enter this._user.
+    const userCryptoKey   = await _sdkImportKey(data.user_key);
+    const deviceCryptoKey = await _sdkImportKey(data.device_key);
 
+    this._user   = { username: data.username, _userCryptoKey: userCryptoKey };
+    this._device = { device_id: data.device_id, device_name: data.device_name };
+    // device_key CryptoKey is stored in IndexedDB, not on this._device
     this._timingOffset = await deriveTimingOffset(data.user_key, data.device_key);
 
     if (opts.persist !== false) {
-      this._persistCredentials();
+      await _sdkStoreKey(_SDK_UK_STORE, data.username, userCryptoKey);
+      await _sdkStoreKey(_SDK_DK_STORE, data.username, deviceCryptoKey);
+      this._persistCredentials();   // persists username/device_id/device_name only
     }
 
     this._log('Registered', this._user.username);
@@ -270,8 +389,17 @@
    * @returns {Promise<DeepFree>} for chaining
    */
   DeepFree.prototype.loadCredentials = async function (creds) {
-    this._user   = { username: creds.username, user_key: creds.user_key };
-    this._device = { device_id: creds.device_id, device_key: creds.device_key, device_name: creds.device_name };
+    // SDK-H1: If raw keys are supplied (e.g. from a server-side token exchange),
+    // import them before storing.  If CryptoKeys are already in IndexedDB
+    // (from a previous session), loadFromStorage() is preferred over this method.
+    const userCryptoKey   = await _sdkImportKey(creds.user_key);
+    const deviceCryptoKey = await _sdkImportKey(creds.device_key);
+
+    await _sdkStoreKey(_SDK_UK_STORE, creds.username, userCryptoKey);
+    await _sdkStoreKey(_SDK_DK_STORE, creds.username, deviceCryptoKey);
+
+    this._user   = { username: creds.username, _userCryptoKey: userCryptoKey };
+    this._device = { device_id: creds.device_id, device_name: creds.device_name };
     this._timingOffset = await deriveTimingOffset(creds.user_key, creds.device_key);
     this._log('Credentials loaded for', this._user.username);
     return this;
@@ -282,13 +410,36 @@
    * @param {string} [storageKey] - localStorage key (default: 'deepfree_credentials')
    * @returns {Promise<boolean>} true if credentials were found and loaded
    */
+  /**
+   * Restore credentials from a previous session.
+   * SDK-H1: Loads CryptoKeys from IndexedDB — no raw key material is read from
+   * localStorage. Returns false if keys are missing (user must re-register).
+   * @param {string} [storageKey] - localStorage key for metadata (default: 'deepfree_credentials')
+   * @returns {Promise<boolean>}
+   */
   DeepFree.prototype.restoreCredentials = async function (storageKey) {
     const key = storageKey || 'deepfree_credentials';
     try {
+      // Read non-secret metadata from localStorage
       const raw = localStorage.getItem(key);
       if (!raw) return false;
-      const creds = JSON.parse(raw);
-      await this.loadCredentials(creds);
+      const meta = JSON.parse(raw);
+      if (!meta.username) return false;
+
+      // Load CryptoKeys from IndexedDB — these are never in localStorage
+      const userCryptoKey   = await _sdkLoadKey(_SDK_UK_STORE, meta.username);
+      const deviceCryptoKey = await _sdkLoadKey(_SDK_DK_STORE, meta.username);
+
+      if (!userCryptoKey || !deviceCryptoKey) {
+        this._log('Stored metadata found but CryptoKeys missing — re-register required');
+        return false;
+      }
+
+      this._user   = { username: meta.username, _userCryptoKey: userCryptoKey };
+      this._device = { device_id: meta.device_id, device_name: meta.device_name };
+      // Timing offset cannot be re-derived without raw keys — store it in metadata
+      this._timingOffset = meta.timing_offset_ms || 0;
+      this._log('Credentials restored from IndexedDB for', meta.username);
       return true;
     } catch (e) {
       this._log('Failed to restore credentials:', e.message);
@@ -297,17 +448,19 @@
   };
 
   DeepFree.prototype._persistCredentials = function (storageKey) {
+    // SDK-H1: Only non-secret metadata is written to localStorage.
+    // user_key and device_key are in IndexedDB as non-extractable CryptoKeys.
     const key = storageKey || 'deepfree_credentials';
     try {
       localStorage.setItem(key, JSON.stringify({
-        username:    this._user.username,
-        user_key:    this._user.user_key,
-        device_id:   this._device.device_id,
-        device_key:  this._device.device_key,
-        device_name: this._device.device_name,
+        username:         this._user.username,
+        device_id:        this._device ? this._device.device_id   : null,
+        device_name:      this._device ? this._device.device_name : null,
+        timing_offset_ms: this._timingOffset || 0,
+        // user_key and device_key are intentionally omitted — they live in IndexedDB
       }));
     } catch (e) {
-      this._log('localStorage unavailable, credentials not persisted');
+      this._log('localStorage unavailable, metadata not persisted');
     }
   };
 
@@ -479,9 +632,18 @@ registerProcessor('carrier-embedder', CarrierEmbedderProcessor);
       self._emit('window', { timeWindow: tw });
       if (tw !== self._carrierWindow) {
         try {
-          const seed = self._device
-            ? await combinedSecret(self._user.user_key, self._device.device_key)
-            : self._user.user_key;
+          // SDK-H1: derive seed from non-extractable CryptoKeys — no raw strings.
+          // combinedSecret() is called with the user CryptoKey and the device
+          // CryptoKey loaded from IndexedDB; neither raw key is ever read out.
+          let seed;
+          if (self._device) {
+            const devCryptoKey = await _sdkLoadKey(_SDK_DK_STORE, self._user.username);
+            seed = devCryptoKey
+              ? await combinedSecret(self._user._userCryptoKey, devCryptoKey)
+              : await _signWithUserKey(self._user._userCryptoKey, 'seed');
+          } else {
+            seed = await _signWithUserKey(self._user._userCryptoKey, 'seed');
+          }
           const amp     = self._opusMode ? CARRIER_AMP_WEBRTC : CARRIER_AMP;
           const carrier = await deriveCarrier(seed, tw, SAMPLE_RATE, CHUNK_FRAMES, amp);
           self._log('Carrier amp: ' + amp + (self._opusMode ? ' (Opus-boosted)' : ' (baseline)'));
@@ -671,7 +833,10 @@ registerProcessor('carrier-embedder', CarrierEmbedderProcessor);
       username:      this._user    ? this._user.username    : '',
       device_id:     this._device  ? this._device.device_id : '',
       session_id:    this._sessionId || '',
-      secret:        this._user    ? this._user.user_key    : 'demo_secret',
+      // SDK-H1: raw user_key is never held as a string — send username instead.
+      // The server resolves the key from the DB when username is provided.
+      // 'secret' field is only evaluated by the server when username is empty.
+      secret:        '',
       chunk_sent_at: Date.now() + (this._timingOffset || 0),
     };
 
@@ -805,7 +970,7 @@ registerProcessor('carrier-embedder', CarrierEmbedderProcessor);
 
   // ─── STATIC ──────────────────────────────────────────────────────────────
 
-  DeepFree.version = '1.0.0';
+  DeepFree.version = '1.1.0';
   DeepFree.WINDOW_SEC   = WINDOW_SEC;
   DeepFree.CHUNK_FRAMES = CHUNK_FRAMES;
   DeepFree.SAMPLE_RATE  = SAMPLE_RATE;
