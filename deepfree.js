@@ -16,6 +16,8 @@
  *               in a JS string after the initial import. Cannot be read back
  *               by JS or browser DevTools.
  *   device_key — same treatment (non-extractable CryptoKey, IndexedDB).
+ *               Group 21: any legacy localStorage device_key_* entries are
+ *               automatically migrated to IndexedDB on SDK init and deleted.
  *   username / device_id / device_name — not secret; stored in localStorage.
  *
  * NONCE-CHALLENGE PROTOCOL (GROUP 14 — deployed):
@@ -229,6 +231,47 @@
     });
   }
 
+  // ─── GROUP 21 — Device Key Web Crypto Migration ──────────────────────────
+  // Fix 21-1: Import a raw device_key hex string as a non-extractable CryptoKey
+  // and store it in IndexedDB under the device_id key.
+  // Called at enrolment and by the localStorage migration shim (Fix 21-4).
+  // After this call the raw hex is no longer needed and must not be retained.
+  function _sdkImportDeviceKey(deviceId, rawHex) {
+    var rawBytes = new Uint8Array(rawHex.match(/.{2}/g).map(function (b) { return parseInt(b, 16); }));
+    return crypto.subtle.importKey(
+      'raw', rawBytes,
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,   // non-extractable — never leaves the crypto subsystem
+      ['sign']
+    ).then(function (cryptoKey) {
+      return _sdkStoreKey(_SDK_DK_STORE, deviceId, cryptoKey);
+    });
+  }
+
+  // Fix 21-4: One-shot migration — any localStorage entries matching
+  // "device_key_<deviceId>" are imported into IndexedDB and then deleted.
+  // Called once during SDK init so existing sessions are upgraded silently.
+  function _sdkMigrateLocalStorageDeviceKeys() {
+    var prefix = 'device_key_';
+    var toMigrate = [];
+    for (var i = 0; i < localStorage.length; i++) {
+      var k = localStorage.key(i);
+      if (k && k.indexOf(prefix) === 0) {
+        var deviceId = k.slice(prefix.length);
+        var rawHex   = localStorage.getItem(k);
+        if (deviceId && rawHex) toMigrate.push({ deviceId: deviceId, rawHex: rawHex, lsKey: k });
+      }
+    }
+    // Process sequentially — avoids overwhelming IndexedDB with concurrent opens
+    return toMigrate.reduce(function (chain, entry) {
+      return chain.then(function () {
+        return _sdkImportDeviceKey(entry.deviceId, entry.rawHex)
+          .then(function () { localStorage.removeItem(entry.lsKey); })
+          .catch(function () { /* leave in place if import fails — do not break chain */ });
+      });
+    }, Promise.resolve());
+  }
+
   /**
    * Sign a message with a non-extractable CryptoKey.
    * Used internally by _sdkNonceHeaders() for all authenticated SDK requests.
@@ -313,6 +356,11 @@
     this._listeners = {};
 
     this._log('DeepFree SDK initialized', { backendUrl: this._backendUrl });
+
+    // GROUP 21 FIX 21-4: Silently migrate any plaintext device_key_* entries
+    // in localStorage into IndexedDB as non-extractable CryptoKeys, then delete
+    // the localStorage entries. No-op if nothing to migrate.
+    _sdkMigrateLocalStorageDeviceKeys().catch(function () { /* non-fatal */ });
   }
 
   // ─── EVENT EMITTER ───────────────────────────────────────────────────────
@@ -995,6 +1043,26 @@ registerProcessor('carrier-embedder', CarrierEmbedderProcessor);
   };
 
   // ─── NONCE-AUTHENTICATED METHODS (Group 14) ──────────────────────────────
+
+  /**
+   * GROUP 21 FIX 21-2 — Sign a message with the non-extractable device CryptoKey.
+   * The key is loaded from IndexedDB (never from localStorage or a JS string).
+   * Used by call.html's updateCarrier() to derive the combined secret without
+   * ever exposing raw device_key bytes to JS.
+   *
+   * @param {string} deviceId — the key under which the CryptoKey was stored
+   * @param {string} message  — message to sign (e.g. 'user-contribution' hex)
+   * @returns {Promise<string>} hex-encoded HMAC-SHA256 signature
+   * @throws {Error} if no device key is found for deviceId
+   */
+  DeepFree.prototype.signWithDeviceKey = async function (deviceId, message) {
+    const cryptoKey = await _sdkLoadKey(_SDK_DK_STORE, deviceId);
+    if (!cryptoKey) throw new Error('DeepFree: device key not found in IndexedDB for ' + deviceId);
+    const enc = new TextEncoder();
+    const sig = await crypto.subtle.sign('HMAC', cryptoKey, enc.encode(message));
+    return Array.from(new Uint8Array(sig))
+      .map(function (b) { return b.toString(16).padStart(2, '0'); }).join('');
+  };
 
   /**
    * Rotate the user's authentication key.
