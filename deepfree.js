@@ -115,6 +115,24 @@
   }
 
   /**
+   * Derive the carrier seed from raw key strings.
+   * Formula: SHA256(user_key_hex + ":" + device_key_hex + ":") — matches
+   * backend derive_combined_secret(user_key, device_key, challenge_code="") exactly.
+   * Called ONCE at register/loadCredentials while raw strings are transiently
+   * available. Result cached as _carrierSeed — not a raw key, safe to keep.
+   * @param {string} userKey   - raw hex
+   * @param {string} deviceKey - raw hex
+   * @returns {Promise<string>} hex seed
+   */
+  async function _deriveCarrierSeed(userKey, deviceKey) {
+    const enc = new TextEncoder();
+    const data = enc.encode(userKey + ':' + deviceKey + ':');
+    const buf = await crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(buf))
+      .map(function (b) { return b.toString(16).padStart(2, '0'); }).join('');
+  }
+
+  /**
    * Derive the HMAC-SHA256 carrier signal for a given (secret, timeWindow).
    * Mirrors backend derive_carrier exactly.
    * @param {string} secret - combined hex secret
@@ -457,6 +475,8 @@
     this._device = { device_id: data.device_id, device_name: data.device_name };
     // device_key CryptoKey is stored in IndexedDB, not on this._device
     this._timingOffset = await deriveTimingOffset(data.user_key, data.device_key);
+    // Cache carrier seed while raw keys are transiently available
+    this._carrierSeed = await _deriveCarrierSeed(data.user_key, data.device_key);
 
     if (opts.persist !== false) {
       await _sdkStoreKey(_SDK_UK_STORE, data.username, userCryptoKey);
@@ -486,6 +506,11 @@
     this._user   = { username: creds.username, _userCryptoKey: userCryptoKey };
     this._device = { device_id: creds.device_id, device_name: creds.device_name };
     this._timingOffset = await deriveTimingOffset(creds.user_key, creds.device_key);
+
+    // Derive and cache the carrier seed while raw keys are transiently available.
+    // Formula: SHA256(user_key_hex + ":" + device_key_hex + ":") — matches backend
+    // derive_combined_secret() exactly. The seed is a one-way hash, not a raw key.
+    this._carrierSeed = await _deriveCarrierSeed(creds.user_key, creds.device_key);
     this._log('Credentials loaded for', this._user.username);
     return this;
   };
@@ -736,15 +761,11 @@ registerProcessor('carrier-embedder', CarrierEmbedderProcessor);
           // SDK-H1: derive seed from non-extractable CryptoKeys — no raw strings.
           // combinedSecret() is called with the user CryptoKey and the device
           // CryptoKey loaded from IndexedDB; neither raw key is ever read out.
-          let seed;
-          if (self._device) {
-            const devCryptoKey = await _sdkLoadKey(_SDK_DK_STORE, self._user.username);
-            seed = devCryptoKey
-              ? await combinedSecret(self._user._userCryptoKey, devCryptoKey)
-              : await _signWithUserKey(self._user._userCryptoKey, 'seed');
-          } else {
-            seed = await _signWithUserKey(self._user._userCryptoKey, 'seed');
-          }
+          // Use the pre-computed carrier seed (SHA256(user_key:device_key:)) which
+          // matches backend derive_combined_secret() exactly. Cached in _carrierSeed
+          // during loadCredentials/register while raw keys were transiently available.
+          const seed = self._carrierSeed
+            || await _signWithUserKey(self._user._userCryptoKey, 'seed');
           const amp     = self._opusMode ? CARRIER_AMP_WEBRTC : CARRIER_AMP;
           const carrier = await deriveCarrier(seed, tw, SAMPLE_RATE, CHUNK_FRAMES, amp);
           self._log('Carrier amp: ' + amp + (self._opusMode ? ' (Opus-boosted)' : ' (baseline)'));
